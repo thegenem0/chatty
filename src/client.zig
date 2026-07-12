@@ -4,6 +4,8 @@ const cmd = @import("command.zig");
 const Server = @import("server.zig").Server;
 const DEFAULT_ROOM = @import("server.zig").DEAFULT_ROOM;
 const tls = @import("tls.zig");
+const auth = @import("auth.zig");
+const Role = @import("root.zig").Role;
 
 const std = @import("std");
 const log = std.log.scoped(.client);
@@ -23,25 +25,57 @@ pub fn handle(server: *Server, stream: net.Stream, ctx: tls.Context, io: std.Io,
     defer server.removeClient(ssl_stream.fd(), io, gpa);
 
     var recv_buf: [4096]u8 = undefined;
+    var user_buf: [64]u8 = undefined;
+    var pass_buf: [256]u8 = undefined;
+    var confirm_buf: [4]u8 = undefined;
 
     var room_buf: [64]u8 = undefined;
     @memcpy(room_buf[0..DEFAULT_ROOM.len], DEFAULT_ROOM);
     var current_room: []u8 = room_buf[0..DEFAULT_ROOM.len];
 
-    ssl_stream.writeAll("Enter username: ") catch return;
-
-    const raw = readLine(&ssl_stream, &recv_buf) catch return orelse return;
-    const username = std.mem.trimEnd(u8, raw, "\r");
+    ssl_stream.writeAll("Username: ") catch return;
+    const raw_user = readLine(&ssl_stream, &user_buf) catch return orelse return;
+    const username = std.mem.trimEnd(u8, raw_user, "\r");
 
     if (username.len == 0 or std.mem.indexOfScalar(u8, username, ' ') != null) {
         ssl_stream.writeAll("Invalid username.\n") catch {};
         return;
     }
 
-    const owned = gpa.dupe(u8, username) catch return;
+    ssl_stream.writeAll("Password: ") catch return;
+    const raw_pass = readLine(&ssl_stream, &pass_buf) catch return orelse return;
+    const password = std.mem.trimEnd(u8, raw_pass, "\r");
 
-    server.addClient(ssl_stream, owned, io, gpa) catch |err| {
-        gpa.free(owned);
+    const login_result = auth.login(&server.db.?, username, password, io, gpa) catch |err| switch (err) {
+        error.UserNotFound => blk: {
+            ssl_stream.writeAll("No account found. Register? [y/N]: ") catch return;
+            const raw = readLine(&ssl_stream, &confirm_buf) catch return orelse return;
+            const confirm = std.mem.trimEnd(u8, raw, "\r");
+            if (!std.mem.eql(u8, confirm, "y") and !std.mem.eql(u8, confirm, "Y")) return;
+
+            auth.register(&server.db.?, username, password, io, gpa) catch {
+                ssl_stream.writeAll("Registration failed.\n") catch {};
+                return;
+            };
+            break :blk auth.login(&server.db.?, username, password, io, gpa) catch return;
+        },
+        error.WrongPassword => {
+            ssl_stream.writeAll("Wrong password.\n") catch {};
+            return;
+        },
+        else => return,
+    };
+
+    defer gpa.free(login_result.user.pass_hash);
+    defer gpa.free(login_result.user.role);
+
+    const role = std.meta.stringToEnum(Role, login_result.user.role) orelse .user;
+    const uname_owned = login_result.user.username;
+
+    server.addClient(ssl_stream, uname_owned, role, login_result.tags, io, gpa) catch |err| {
+        gpa.free(uname_owned);
+        for (login_result.tags) |t| gpa.free(t);
+        gpa.free(login_result.tags);
         return switch (err) {
             error.UsernameTaken => ssl_stream.writeAll("Username already taken.\n") catch {},
             else => log.err("addClient failed: {}", .{err}),
@@ -49,7 +83,7 @@ pub fn handle(server: *Server, stream: net.Stream, ctx: tls.Context, io: std.Io,
     };
 
     var prompt_buf: [64]u8 = undefined;
-    const prompt = std.fmt.bufPrint(&prompt_buf, "[{s}] > ", .{owned}) catch unreachable;
+    const prompt = std.fmt.bufPrint(&prompt_buf, "[{s}] > ", .{uname_owned}) catch unreachable;
     ssl_stream.writeAll(prompt) catch return;
 
     while (true) {
@@ -76,10 +110,10 @@ pub fn handle(server: *Server, stream: net.Stream, ctx: tls.Context, io: std.Io,
                     }
                     @memcpy(room_buf[0..name.len], name);
                     current_room = room_buf[0..name.len];
-                    server.joinRoom(owned, current_room, io, gpa) catch {};
+                    server.joinRoom(uname_owned, current_room, io, gpa) catch {};
                 },
 
-                .leave => server.joinRoom(owned, DEFAULT_ROOM, io, gpa) catch {},
+                .leave => server.joinRoom(uname_owned, DEFAULT_ROOM, io, gpa) catch {},
 
                 .whisper => |args| {
                     const sep = std.mem.indexOfScalar(u8, args, ' ') orelse {
@@ -88,7 +122,7 @@ pub fn handle(server: *Server, stream: net.Stream, ctx: tls.Context, io: std.Io,
                     };
                     const target = args[0..sep];
                     const dm = args[sep + 1 ..];
-                    server.whisper(owned, target, dm, io) catch {
+                    server.whisper(uname_owned, target, dm, io) catch {
                         ssl_stream.writeAll("User not found.\n") catch {};
                     };
                 },
@@ -125,7 +159,7 @@ pub fn handle(server: *Server, stream: net.Stream, ctx: tls.Context, io: std.Io,
             }
         } else {
             var msg_buf: [4096]u8 = undefined;
-            const padded = std.fmt.bufPrint(&msg_buf, "[{s}]: {s}\n", .{ owned, msg }) catch unreachable;
+            const padded = std.fmt.bufPrint(&msg_buf, "[{s}]: {s}\n", .{ uname_owned, msg }) catch unreachable;
             server.broadcastToRoom(padded, current_room, ssl_stream.fd(), io) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
             };

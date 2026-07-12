@@ -18,6 +18,11 @@ pub fn build(b: *std.Build) void {
     exe.root_module.linkSystemLibrary("crypto", .{});
     exe.root_module.link_libc = true;
 
+    exe.root_module.addCSourceFile(.{
+        .file = b.path("src/sqlite/sqlite3.c"),
+        .flags = &.{},
+    });
+
     b.installArtifact(exe);
 
     const run_step = b.step("run", "Run the app");

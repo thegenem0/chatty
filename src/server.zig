@@ -1,8 +1,11 @@
-const net = std.Io.net;
-
+const auth = @import("auth.zig");
 const client = @import("client.zig");
+const db = @import("db.zig");
+const Role = @import("root.zig").Role;
 const StatefulClient = @import("root.zig").StatefulClient;
 const tls = @import("tls.zig");
+
+const net = std.Io.net;
 
 const std = @import("std");
 const log = std.log.scoped(.server);
@@ -10,16 +13,22 @@ const log = std.log.scoped(.server);
 pub const Config = struct {
     host: []const u8 = "127.0.0.1",
     port: u16 = 7070,
+    db_path: [:0]const u8 = "chatty.db",
 };
 
 pub const DEAFULT_ROOM: []const u8 = "general";
 
 pub const Server = struct {
     mu: std.Io.Mutex = .init,
+    db: ?db.Db = null,
     clients: std.ArrayList(StatefulClient) = .empty,
     banned: std.ArrayList([]const u8) = .empty,
 
     pub fn run(self: *Server, config: Config, io: std.Io, gpa: std.mem.Allocator) !void {
+        self.db = try db.Db.open(config.db_path);
+        try self.db.?.migrate();
+        defer self.db.?.close();
+
         const addr = try net.IpAddress.parseIp4(config.host, config.port);
         var server = try addr.listen(io, .{ .reuse_address = true });
         defer server.deinit(io);
@@ -38,7 +47,15 @@ pub const Server = struct {
         }
     }
 
-    pub fn addClient(self: *Server, ssl_stream: tls.Stream, uname: []const u8, io: std.Io, gpa: std.mem.Allocator) !void {
+    pub fn addClient(
+        self: *Server,
+        ssl_stream: tls.Stream,
+        uname: []const u8,
+        role: Role,
+        tags: []const []const u8,
+        io: std.Io,
+        gpa: std.mem.Allocator,
+    ) !void {
         try self.mu.lock(io);
         defer self.mu.unlock(io);
         for (self.clients.items) |c| {
@@ -48,6 +65,8 @@ pub const Server = struct {
             .ssl_stream = ssl_stream,
             .username = uname,
             .room = try gpa.dupe(u8, DEAFULT_ROOM),
+            .role = role,
+            .tags = tags,
         });
     }
 
@@ -58,6 +77,8 @@ pub const Server = struct {
             if (c.ssl_stream.fd() == fd) {
                 gpa.free(c.username);
                 gpa.free(c.room);
+                for (c.tags) |t| gpa.free(t);
+                gpa.free(c.tags);
                 _ = self.clients.swapRemove(i);
                 return;
             }
