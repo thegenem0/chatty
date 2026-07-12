@@ -1,0 +1,4 @@
+/.zig-cache
+/cert.pem
+/key.pem
+/zig-out/bin
