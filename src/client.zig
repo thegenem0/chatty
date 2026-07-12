@@ -101,6 +101,20 @@ pub fn handle(server: *Server, stream: net.Stream, ctx: tls.Context, io: std.Io,
                     ssl_stream.writeAll("User not found.\n") catch {};
                 },
 
+                .help => ssl_stream.writeAll(
+                    \\Commands:
+                    \\  /help                    show this message
+                    \\  /list                    list users in current room
+                    \\  /rooms                   list all active rooms
+                    \\  /join <room>             join a room
+                    \\  /leave                   return to #general
+                    \\  /whisper <user> <msg>    send a private message
+                    \\  /kick <user>             kick a user
+                    \\  /ban <user>              ban a user
+                    \\  /quit                    disconnect
+                    \\
+                ) catch {},
+
                 .quit => return,
 
                 .unknown => |verb| {

@@ -8,6 +8,7 @@ const Command = union(enum) {
     whisper: []const u8,
     kick: []const u8,
     ban: []const u8,
+    help,
     quit,
     unknown: []const u8,
 };
@@ -25,6 +26,7 @@ pub fn parseCommand(line: []const u8) ?Command {
     if (std.mem.eql(u8, verb, "whisper")) return .{ .whisper = args };
     if (std.mem.eql(u8, verb, "kick")) return .{ .kick = args };
     if (std.mem.eql(u8, verb, "ban")) return .{ .ban = args };
+    if (std.mem.eql(u8, verb, "help")) return .help;
     if (std.mem.eql(u8, verb, "quit")) return .quit;
 
     return .{ .unknown = verb };
