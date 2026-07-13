@@ -1,16 +1,21 @@
 const net = std.Io.net;
 
-const cmd = @import("command.zig");
 const Server = @import("server.zig").Server;
 const DEFAULT_ROOM = @import("server.zig").DEAFULT_ROOM;
 const tls = @import("tls.zig");
 const auth = @import("auth.zig");
-const Role = @import("root.zig").Role;
+const lib = @import("root.zig");
 
 const std = @import("std");
 const log = std.log.scoped(.client);
 
-pub fn handle(server: *Server, stream: net.Stream, ctx: tls.Context, io: std.Io, gpa: std.mem.Allocator) std.Io.Cancelable!void {
+pub fn handle(
+    server: *Server,
+    stream: net.Stream,
+    ctx: tls.Context,
+    io: std.Io,
+    gpa: std.mem.Allocator,
+) std.Io.Cancelable!void {
     defer {
         var s = stream;
         s.close(io);
@@ -69,8 +74,10 @@ pub fn handle(server: *Server, stream: net.Stream, ctx: tls.Context, io: std.Io,
     defer gpa.free(login_result.user.pass_hash);
     defer gpa.free(login_result.user.role);
 
-    const role = std.meta.stringToEnum(Role, login_result.user.role) orelse .user;
+    const role = std.meta.stringToEnum(lib.Role, login_result.user.role) orelse .user;
     const uname_owned = login_result.user.username;
+    const my_id = login_result.user.id;
+    const my_tags = login_result.tags;
 
     server.addClient(ssl_stream, uname_owned, role, login_result.tags, io, gpa) catch |err| {
         gpa.free(uname_owned);
@@ -96,7 +103,7 @@ pub fn handle(server: *Server, stream: net.Stream, ctx: tls.Context, io: std.Io,
         } orelse return;
         const msg = std.mem.trimEnd(u8, line, "\r");
 
-        if (cmd.parseCommand(msg)) |c| {
+        if (lib.parseCommand(msg)) |c| {
             switch (c) {
                 .users => server.listUsers(&ssl_stream, current_room, io) catch {},
 
@@ -108,6 +115,24 @@ pub fn handle(server: *Server, stream: net.Stream, ctx: tls.Context, io: std.Io,
                         ssl_stream.writeAll("Room name too long.\n") catch {};
                         continue;
                     }
+
+                    const ch_tags = server.db.?.getChannelTags(name, gpa) catch {
+                        ssl_stream.writeAll("Failed to check channel access.\n") catch {};
+                        continue;
+                    };
+                    defer {
+                        for (ch_tags) |t| gpa.free(t);
+                        gpa.free(ch_tags);
+                    }
+
+                    if (!lib.can(role, .{ .joinChannel = .{
+                        .user_tags = my_tags,
+                        .channel_tags = ch_tags,
+                    } })) {
+                        ssl_stream.writeAll("You don't have permission to join this channel.\n") catch {};
+                        continue;
+                    }
+
                     @memcpy(room_buf[0..name.len], name);
                     current_room = room_buf[0..name.len];
                     server.joinRoom(uname_owned, current_room, io, gpa) catch {};
@@ -127,25 +152,171 @@ pub fn handle(server: *Server, stream: net.Stream, ctx: tls.Context, io: std.Io,
                     };
                 },
 
-                .kick => |target| server.kick(target, io) catch {
-                    ssl_stream.writeAll("User not found.\n") catch {};
+                .kick => |target| {
+                    if (!lib.can(role, .kick)) {
+                        ssl_stream.writeAll("Permission denied.\n") catch {};
+                        continue;
+                    }
+                    server.kick(target, io) catch {
+                        ssl_stream.writeAll("User not found.\n") catch {};
+                    };
                 },
 
-                .ban => |target| server.ban(target, io, gpa) catch {
-                    ssl_stream.writeAll("User not found.\n") catch {};
+                .ban => |target| {
+                    if (!lib.can(role, .ban)) {
+                        ssl_stream.writeAll("Permission denied.\n") catch {};
+                        continue;
+                    }
+                    server.ban(target, io, gpa) catch {
+                        ssl_stream.writeAll("User not found.\n") catch {};
+                    };
+                },
+
+                .createChannel => |args| {
+                    if (!lib.can(role, .createChannel)) {
+                        var temp_buf: [256]u8 = undefined;
+                        const temp_line = std.fmt.bufPrint(&temp_buf, "Permission denied. Current role: {s}", .{login_result.user.role}) catch unreachable;
+                        ssl_stream.writeAll(temp_line) catch {};
+                        continue;
+                    }
+
+                    var iter = std.mem.splitScalar(u8, args, ' ');
+                    const ch_name = iter.next() orelse "";
+                    if (ch_name.len == 0) {
+                        ssl_stream.writeAll("Usage: /createchannel <name> [tag...]\n") catch {};
+                        continue;
+                    }
+
+                    var tags_buf: [16][]const u8 = undefined;
+                    var tags_len: usize = 0;
+                    while (iter.next()) |tag| {
+                        if (tag.len == 0) continue;
+                        if (tags_len < tags_buf.len) {
+                            tags_buf[tags_len] = tag;
+                            tags_len += 1;
+                        }
+                    }
+                    server.db.?.createChannel(ch_name, my_id, tags_buf[0..tags_len]) catch {
+                        ssl_stream.writeAll("Failed to create channel.\n") catch {};
+                        continue;
+                    };
+
+                    var buf: [128]u8 = undefined;
+                    const success_msg = std.fmt.bufPrint(&buf, "Channel #{s} created.\n", .{ch_name}) catch unreachable;
+                    ssl_stream.writeAll(success_msg) catch {};
+                },
+
+                .addTag => |args| {
+                    if (!lib.can(role, .manageTags)) {
+                        ssl_stream.writeAll("Permission denied.\n") catch {};
+                        continue;
+                    }
+                    const sep = std.mem.indexOfScalar(u8, args, ' ') orelse {
+                        ssl_stream.writeAll("Usage: /addtag <user> <tag>\n") catch {};
+                        continue;
+                    };
+                    server.db.?.addUserTag(args[0..sep], args[sep + 1 ..]) catch {
+                        ssl_stream.writeAll("User not found.\n") catch {};
+                        continue;
+                    };
+                    ssl_stream.writeAll("Tag added.\n") catch {};
+                },
+
+                .removeTag => |args| {
+                    if (!lib.can(role, .manageTags)) {
+                        ssl_stream.writeAll("Permission denied.\n") catch {};
+                        continue;
+                    }
+                    const sep = std.mem.indexOfScalar(u8, args, ' ') orelse {
+                        ssl_stream.writeAll("Usage: /removetag <user> <tag>\n") catch {};
+                        continue;
+                    };
+                    server.db.?.removeUserTag(args[0..sep], args[sep + 1 ..]) catch {
+                        ssl_stream.writeAll("User not found.\n") catch {};
+                        continue;
+                    };
+                    ssl_stream.writeAll("Tag removed.\n") catch {};
+                },
+
+                .setMod => |target| {
+                    if (!lib.can(role, .manageTags)) {
+                        ssl_stream.writeAll("Permission denied.\n") catch {};
+                        continue;
+                    }
+                    server.db.?.setUserRole(target, "mod") catch {
+                        ssl_stream.writeAll("User not found.\n") catch {};
+                        continue;
+                    };
+                    ssl_stream.writeAll("User promoted to mod.\n") catch {};
+                },
+
+                .demote => |target| {
+                    if (!lib.can(role, .manageTags)) {
+                        ssl_stream.writeAll("Permission denied.\n") catch {};
+                        continue;
+                    }
+                    server.db.?.setUserRole(target, "user") catch {
+                        ssl_stream.writeAll("User not found.\n") catch {};
+                        continue;
+                    };
+                    ssl_stream.writeAll("User demoted.\n") catch {};
+                },
+
+                .tags => {
+                    if (my_tags.len == 0) {
+                        ssl_stream.writeAll("You have no tags.\n") catch {};
+                    } else {
+                        ssl_stream.writeAll("Your tags:\n") catch {};
+                        for (my_tags) |t| {
+                            var buf: [128]u8 = undefined;
+                            const tag_line = std.fmt.bufPrint(&buf, "  {s}\n", .{t}) catch continue;
+                            ssl_stream.writeAll(tag_line) catch {};
+                        }
+                    }
+                },
+
+                .channelInfo => |ch_name| {
+                    const ch_tags = server.db.?.getChannelTags(ch_name, gpa) catch {
+                        ssl_stream.writeAll("Failed to get channel info.\n") catch {};
+                        continue;
+                    };
+                    defer {
+                        for (ch_tags) |t| gpa.free(t);
+                        gpa.free(ch_tags);
+                    }
+
+                    var hdr: [128]u8 = undefined;
+                    ssl_stream.writeAll(
+                        std.fmt.bufPrint(&hdr, "#{s} required tags:\n", .{ch_name}) catch unreachable,
+                    ) catch {};
+                    if (ch_tags.len == 0) {
+                        ssl_stream.writeAll("  (none - public)\n") catch {};
+                    } else {
+                        for (ch_tags) |t| {
+                            var buf: [128]u8 = undefined;
+                            ssl_stream.writeAll(std.fmt.bufPrint(&buf, "  {s}\n", .{t}) catch continue) catch {};
+                        }
+                    }
                 },
 
                 .help => ssl_stream.writeAll(
                     \\Commands:
-                    \\  /help                    show this message
-                    \\  /list                    list users in current room
-                    \\  /rooms                   list all active rooms
-                    \\  /join <room>             join a room
-                    \\  /leave                   return to #general
-                    \\  /whisper <user> <msg>    send a private message
-                    \\  /kick <user>             kick a user
-                    \\  /ban <user>              ban a user
-                    \\  /quit                    disconnect
+                    \\  /help                          show this message
+                    \\  /users                         list users in current room
+                    \\  /rooms                         list all active rooms
+                    \\  /join <room>                   join a room
+                    \\  /leave                         return to #general
+                    \\  /whisper <user> <msg>          send a private message
+                    \\  /kick <user>                   kick a user (mod/admin)
+                    \\  /ban <user>                    ban a user (admin)
+                    \\  /createchannel <name> [tag...] create a channel (mod/admin)
+                    \\  /addtag <user> <tag>           grant a tag (admin)
+                    \\  /removetag <user> <tag>        revoke a tag (admin)
+                    \\  /setmod <user>                 promote to mod (admin)
+                    \\  /demote <user>                 demote to user (admin)
+                    \\  /tags                          show your tags
+                    \\  /channelinfo <channel>         show a channel's required tags
+                    \\  /quit                          disconnect
                     \\
                 ) catch {},
 
